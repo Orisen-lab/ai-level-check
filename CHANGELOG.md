@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### 修正
+
+- **collect.py 讀得到 Codex 壓縮存檔的對話。** Codex 會把舊對話存成 `.jsonl.zst`，原本完全略過，本人在 Codex 的操作會被漏算，連帶讓多棲判斷失真。現在優先用 `zstandard` 套件、沒有就呼叫 `zstd` 指令解壓；兩者都沒有時，證據包會列出沒讀到的檔數並提醒安裝，不再靜默略過。
+- **被程式呼叫的 `codex exec` 改算自動化。** 這類對話（例如 Claude Code 派 Codex 去生圖）的 `thread_source` 也寫 `user`，原本因此被算成本人操作。現在先看 `source`／`originator` 是不是 exec，再看 `thread_source`。
+- **Claude Code 子代理納入計算。** 子代理紀錄放在 `projects/<專案>/<主對話>/subagents/` 底下，原本沒掃到，子代理一律是 0。
+- 新增 `evals/test_collect_zst_subagent_exec.py` 涵蓋以上三種情境。
+
 ### 變更
 
 - **補齊公平判斷準則：觀察到 ≠ 現在還在發生。** 解決評估窗口前期已淘汰的舊行為被當成現況誤報的問題。列為「目前沒做好／不足」之前，必須確認該行為在評估窗口後半期仍有出現；只在前段出現且後續已改進或被新工具取代的，轉列為「期間內已改進的做法」（正面演進證據），不得列為現況不足。感謝 [dindins](https://github.com/dindins) 的 #4。
