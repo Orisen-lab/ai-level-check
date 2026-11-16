@@ -41,7 +41,9 @@ import glob
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 from collections import Counter
 
@@ -461,19 +463,59 @@ def proto_unix_ts(blob):
     return found
 
 
+# 讀不了的壓縮檔記在這裡，main() 最後提醒，避免「沒讀到」被當成「沒用過」。
+SKIPPED_COMPRESSED = []
+
+
+def _zst_lines(path):
+    """Codex 會把舊對話壓成 .jsonl.zst。優先用 zstandard 套件，沒有就呼叫 zstd 指令。"""
+    try:
+        import zstandard  # type: ignore
+        with open(path, "rb") as raw:
+            reader = zstandard.ZstdDecompressor().stream_reader(raw)
+            import io
+            for line in io.TextIOWrapper(reader, encoding="utf-8", errors="ignore"):
+                yield line
+        return
+    except ImportError:
+        pass
+    exe = shutil.which("zstd")
+    if not exe:
+        SKIPPED_COMPRESSED.append(path)
+        return
+    try:
+        out = subprocess.run([exe, "-dc", path], capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        SKIPPED_COMPRESSED.append(path)
+        return
+    for line in out.decode("utf-8", errors="ignore").splitlines():
+        yield line
+
+
 def iter_jsonl(path):
     try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except Exception:
-                    continue
+        if path.endswith(".zst"):
+            lines = _zst_lines(path)
+        else:
+            lines = open(path, "r", encoding="utf-8", errors="ignore")
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
     except OSError:
         return
+
+
+def session_id_from(path):
+    base = os.path.basename(path)
+    for ext in (".jsonl.zst", ".jsonl"):
+        if base.endswith(ext):
+            return base[: -len(ext)]
+    return os.path.splitext(base)[0]
 
 
 # ---------------------------------------------------------------- Claude Code
@@ -495,10 +537,16 @@ def classify_claude(entrypoint, sidechain, human_marked):
 
 def load_claude_code(root, since, until):
     sessions = []
-    for path in glob.glob(os.path.join(root, "projects", "*", "*.jsonl")):
-        sid = os.path.splitext(os.path.basename(path))[0]
+    # 子代理的紀錄不在專案目錄第一層，而是在 <專案>/<主對話 ID>/subagents/agent-*.jsonl。
+    main_paths = glob.glob(os.path.join(root, "projects", "*", "*.jsonl"))
+    sub_paths = glob.glob(os.path.join(root, "projects", "*", "*", "subagents", "*.jsonl"))
+    for path in main_paths + sub_paths:
+        is_sub_file = os.path.basename(os.path.dirname(path)) == "subagents"
+        sid = session_id_from(path)
+        if is_sub_file:
+            sid = os.path.basename(os.path.dirname(os.path.dirname(path))) + "/" + sid
         sess = Session(sid, "claude-code", path)
-        entrypoint, sidechain, hit = None, False, False
+        entrypoint, sidechain, hit = None, is_sub_file, False
         for d in iter_jsonl(path):
             typ = d.get("type")
             if d.get("entrypoint") and not entrypoint:
@@ -589,22 +637,27 @@ def classify_codex(meta):
     src = meta.get("source")
     if isinstance(src, dict) and "subagent" in src:
         return SUBAGENT
+    orig = str(meta.get("originator") or "").lower()
+    # codex exec（例如被 Claude Code 或排程呼叫去生圖）的 thread_source 也寫 "user"，
+    # 所以程式驅動的判斷必須排在 thread_source 之前，否則會被算成本人操作。
+    if src == "exec" or "exec" in orig or "sdk" in orig:
+        return AUTOMATION
     if thread == "user":
         return HUMAN
-    orig = str(meta.get("originator") or "").lower()
     if orig in CODEX_HUMAN_ORIGINATORS:
         return HUMAN
-    if "exec" in orig or "sdk" in orig or src == "exec":
-        return AUTOMATION
     return HUMAN
 
 
 def load_codex(root, since, until):
     sessions = []
-    paths = (glob.glob(os.path.join(root, "sessions", "*", "*", "*", "*.jsonl"))
-             + glob.glob(os.path.join(root, "archived_sessions", "*", "*", "*", "*.jsonl")))
-    for path in paths:
-        sid = os.path.splitext(os.path.basename(path))[0]
+    paths = []
+    for sub in ("sessions", "archived_sessions"):
+        for pat in ("*.jsonl", "*.jsonl.zst"):
+            paths += glob.glob(os.path.join(root, sub, "*", "*", "*", pat))
+            paths += glob.glob(os.path.join(root, sub, pat))  # 封存區可能是平放
+    for path in sorted(set(paths)):
+        sid = session_id_from(path)
         sess = Session(sid, "codex", path)
         meta, hit = {}, False
         for d in iter_jsonl(path):
@@ -1283,6 +1336,12 @@ def main():
     os.makedirs(out, exist_ok=True)
 
     summary = build_summary(sessions, since, until, used)
+    if SKIPPED_COMPRESSED:
+        summary["unread_compressed"] = {
+            "_note": "這些壓縮紀錄沒讀到（缺 zstandard 套件與 zstd 指令）。報告的缺口段必須寫明，不能當成沒用過。",
+            "count": len(SKIPPED_COMPRESSED),
+            "examples": [redact(x) for x in SKIPPED_COMPRESSED[:5]],
+        }
     with open(os.path.join(out, "summary.json"), "w", encoding="utf-8") as fh:
         json.dump(summary, fh, ensure_ascii=False, indent=2)
     with open(os.path.join(out, "metrics.md"), "w", encoding="utf-8") as fh:
@@ -1302,6 +1361,9 @@ def main():
               % (ef["tokens_output"],
                  ",".join(ef.get("tokens_from_sources") or []) or "無",
                  ",".join(ef.get("tokens_unavailable_sources") or []) or "無"))
+    if SKIPPED_COMPRESSED:
+        print("  注意：%d 個壓縮紀錄沒讀到。裝 zstd（brew install zstd）或 pip install zstandard 後重跑。"
+              % len(SKIPPED_COMPRESSED))
     if sp["human"] == 0:
         print("  這個期間沒有本人操作的紀錄。分析階段請寫「無法定級」，不要拿 LV0 當預設。")
 
